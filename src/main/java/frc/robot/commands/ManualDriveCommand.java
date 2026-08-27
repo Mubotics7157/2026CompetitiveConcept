@@ -1,5 +1,7 @@
 package frc.robot.commands;
 
+import static edu.wpi.first.units.Units.MetersPerSecond;
+import static edu.wpi.first.units.Units.RadiansPerSecond;
 import static edu.wpi.first.units.Units.Seconds;
 
 import java.util.Optional;
@@ -8,9 +10,11 @@ import java.util.function.DoubleSupplier;
 import com.ctre.phoenix6.swerve.SwerveModule.DriveRequestType;
 import com.ctre.phoenix6.swerve.SwerveModule.SteerRequestType;
 import com.ctre.phoenix6.swerve.SwerveRequest;
-import com.ctre.phoenix6.swerve.SwerveRequest.ForwardPerspectiveValue;
 
+import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
 import edu.wpi.first.units.measure.Time;
 import edu.wpi.first.wpilibj2.command.Command;
 import frc.robot.Constants.Driving;
@@ -18,6 +22,7 @@ import frc.robot.subsystems.Swerve;
 import frc.util.DriveInputSmoother;
 import frc.util.ManualDriveInput;
 import frc.util.Stopwatch;
+import frc.util.swerve.SwerveSetpoint;
 
 /**
  * Teleop manual drive command for the swerve drivetrain.
@@ -25,6 +30,11 @@ import frc.util.Stopwatch;
  * Handles field-centric driving with manual rotation input and
  * heading-hold behavior after a short delay once rotation input
  * returns to zero.
+ *
+ * <p>Desired chassis speeds are run through {@link Swerve#generateSetpoint} every loop before
+ * being commanded, so the modules only ever get asked to do what they can physically follow -
+ * this is what keeps aggressive stick input from breaking traction, rather than reacting to a
+ * skid after it's already happened (see {@code SkidDetector}, which this feeds back into).
  */
 public class ManualDriveCommand extends Command {
     private enum State {
@@ -34,23 +44,17 @@ public class ManualDriveCommand extends Command {
     }
 
     private static final Time kHeadingLockDelay = Seconds.of(0.25); // time to wait before locking heading
+    private static final Time kLoopPeriod = Seconds.of(0.02); // matches the default TimedRobot loop
 
     private final Swerve swerve;
     private final DriveInputSmoother inputSmoother;
     private final SwerveRequest.Idle idleRequest = new SwerveRequest.Idle();
 
-    private final SwerveRequest.FieldCentric fieldCentricRequest = new SwerveRequest.FieldCentric()
+    private final SwerveRequest.ApplyRobotSpeeds applyRobotSpeedsRequest = new SwerveRequest.ApplyRobotSpeeds()
         .withDriveRequestType(DriveRequestType.OpenLoopVoltage)
-        .withSteerRequestType(SteerRequestType.MotionMagicExpo)
-        .withForwardPerspective(ForwardPerspectiveValue.OperatorPerspective);
+        .withSteerRequestType(SteerRequestType.MotionMagicExpo);
 
-    private final SwerveRequest.FieldCentricFacingAngle fieldCentricFacingAngleRequest = new SwerveRequest.FieldCentricFacingAngle()
-        .withRotationalDeadband(Driving.kPIDRotationDeadband)
-        .withMaxAbsRotationalRate(Driving.kMaxRotationalRate)
-        .withDriveRequestType(DriveRequestType.OpenLoopVoltage)
-        .withSteerRequestType(SteerRequestType.MotionMagicExpo)
-        .withForwardPerspective(ForwardPerspectiveValue.OperatorPerspective)
-        .withHeadingPID(5, 0, 0);
+    private final PIDController headingController = new PIDController(5, 0, 0);
 
     private State currentState = State.IDLING;
     private Optional<Rotation2d> lockedHeading = Optional.empty();
@@ -65,6 +69,7 @@ public class ManualDriveCommand extends Command {
     ) {
         this.swerve = swerve;
         this.inputSmoother = new DriveInputSmoother(forwardInput, leftInput, rotationInput);
+        headingController.enableContinuousInput(-Math.PI, Math.PI);
         addRequirements(swerve);
     }
 
@@ -96,6 +101,27 @@ public class ManualDriveCommand extends Command {
         }
     }
 
+    /**
+     * Converts a velocity given in operator-perspective (driver "forward"/"left", independent of
+     * alliance) into true field-relative, then into robot-relative chassis speeds - the frame the
+     * setpoint generator and module kinematics need.
+     */
+    private ChassisSpeeds toRobotRelative(double forwardMPS, double leftMPS, double omegaRadPerSec) {
+        final Translation2d trueFieldVelocity =
+            new Translation2d(forwardMPS, leftMPS).rotateBy(swerve.getOperatorForwardDirection().unaryMinus());
+        return ChassisSpeeds.fromFieldRelativeSpeeds(
+            trueFieldVelocity.getX(),
+            trueFieldVelocity.getY(),
+            omegaRadPerSec,
+            swerve.getState().Pose.getRotation()
+        );
+    }
+
+    private void driveTowards(ChassisSpeeds desiredRobotRelative) {
+        final SwerveSetpoint setpoint = swerve.generateSetpoint(desiredRobotRelative, kLoopPeriod.in(Seconds));
+        swerve.setControl(applyRobotSpeedsRequest.withSpeeds(setpoint.robotRelativeSpeeds()));
+    }
+
     @Override
     public void initialize() {
         currentState = State.IDLING;
@@ -119,24 +145,32 @@ public class ManualDriveCommand extends Command {
         switch (currentState) {
             case IDLING:
                 swerve.setControl(idleRequest);
+                swerve.resetSetpoint();
                 break;
-            case DRIVING_WITH_MANUAL_ROTATION:
+            case DRIVING_WITH_MANUAL_ROTATION: {
                 lockHeadingIfRotationStopped(input);
-                swerve.setControl(
-                    fieldCentricRequest
-                        .withVelocityX(Driving.kMaxSpeed.times(input.forward))
-                        .withVelocityY(Driving.kMaxSpeed.times(input.left))
-                        .withRotationalRate(Driving.kMaxRotationalRate.times(input.rotation))
+                final ChassisSpeeds desired = toRobotRelative(
+                    Driving.kMaxSpeed.times(input.forward).in(MetersPerSecond),
+                    Driving.kMaxSpeed.times(input.left).in(MetersPerSecond),
+                    Driving.kMaxRotationalRate.times(input.rotation).in(RadiansPerSecond)
                 );
+                driveTowards(desired);
                 break;
-            case DRIVING_WITH_LOCKED_HEADING:
-                swerve.setControl(
-                    fieldCentricFacingAngleRequest
-                        .withVelocityX(Driving.kMaxSpeed.times(input.forward))
-                        .withVelocityY(Driving.kMaxSpeed.times(input.left))
-                        .withTargetDirection(lockedHeading.get())
+            }
+            case DRIVING_WITH_LOCKED_HEADING: {
+                final double trueTargetRad =
+                    lockedHeading.get().rotateBy(swerve.getOperatorForwardDirection().unaryMinus()).getRadians();
+                final double omegaRadPerSec = headingController.calculate(
+                    swerve.getState().Pose.getRotation().getRadians(), trueTargetRad
                 );
+                final ChassisSpeeds desired = toRobotRelative(
+                    Driving.kMaxSpeed.times(input.forward).in(MetersPerSecond),
+                    Driving.kMaxSpeed.times(input.left).in(MetersPerSecond),
+                    omegaRadPerSec
+                );
+                driveTowards(desired);
                 break;
+            }
         }
     }
 

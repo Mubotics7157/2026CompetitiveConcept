@@ -1,5 +1,8 @@
 package frc.robot.subsystems;
 
+import static edu.wpi.first.units.Units.MetersPerSecond;
+import static edu.wpi.first.units.Units.RadiansPerSecond;
+
 import java.util.function.Supplier;
 
 import com.ctre.phoenix6.Utils;
@@ -13,14 +16,23 @@ import edu.wpi.first.math.VecBuilder;
 import edu.wpi.first.math.controller.PIDController;
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
+import edu.wpi.first.math.geometry.Translation2d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
+import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
 import edu.wpi.first.math.numbers.N1;
 import edu.wpi.first.math.numbers.N3;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
 import edu.wpi.first.wpilibj2.command.Command;
 import edu.wpi.first.wpilibj2.command.Subsystem;
+import frc.robot.Constants.Traction;
 import frc.robot.generated.TunerConstants;
 import frc.robot.generated.TunerConstants.TunerSwerveDrivetrain;
+import frc.util.swerve.ModuleLimits;
+import frc.util.swerve.SkidDetector;
+import frc.util.swerve.SwerveSetpoint;
+import frc.util.swerve.SwerveSetpointGenerator;
 
 public class Swerve extends TunerSwerveDrivetrain implements Subsystem {
     /* Blue alliance sees forward as 0 degrees (toward red alliance wall) */
@@ -36,6 +48,24 @@ public class Swerve extends TunerSwerveDrivetrain implements Subsystem {
     private final PIDController pathYController = new PIDController(10, 0, 0);
     private final PIDController pathThetaController = new PIDController(7, 0, 0);
 
+    /* Module locations, in FrontLeft/FrontRight/BackLeft/BackRight order to match the order
+     * modules are constructed in below (and therefore the order getState().ModuleStates reports
+     * them in). Shared by the setpoint generator and skid detector so both agree with the
+     * drivetrain about which module is which. */
+    private final Translation2d[] moduleLocations = new Translation2d[] {
+        new Translation2d(TunerConstants.FrontLeft.LocationX, TunerConstants.FrontLeft.LocationY),
+        new Translation2d(TunerConstants.FrontRight.LocationX, TunerConstants.FrontRight.LocationY),
+        new Translation2d(TunerConstants.BackLeft.LocationX, TunerConstants.BackLeft.LocationY),
+        new Translation2d(TunerConstants.BackRight.LocationX, TunerConstants.BackRight.LocationY),
+    };
+    private final SwerveDriveKinematics kinematics = new SwerveDriveKinematics(moduleLocations);
+
+    private final SwerveSetpointGenerator setpointGenerator = new SwerveSetpointGenerator(
+        kinematics, moduleLocations, Traction.kMassKg, Traction.kWheelCoefficientOfFriction
+    );
+    private final SkidDetector skidDetector = new SkidDetector(kinematics, Traction.kSkidToleranceMPS);
+    private SwerveSetpoint previousSetpoint;
+
     public Swerve() {
         super(
             TunerConstants.DrivetrainConstants, 
@@ -47,6 +77,41 @@ public class Swerve extends TunerSwerveDrivetrain implements Subsystem {
             TunerConstants.BackLeft, 
             TunerConstants.BackRight
         );
+        previousSetpoint = SwerveSetpoint.zero(getState().ModuleStates);
+    }
+
+    /**
+     * Steps the drivetrain's remembered setpoint one loop toward the desired robot-relative
+     * chassis speeds, respecting drive acceleration, steering slew rate, and traction limits.
+     * While a skid is detected, acceleration is derated to help the wheels recover grip before
+     * asking for more.
+     *
+     * <p>Callers should feed back the returned setpoint's speeds as the actual command (e.g. via
+     * {@code SwerveRequest.ApplyRobotSpeeds}), and call this again next loop - the generator needs
+     * to see its own previous output, not the measured robot state, to remain consistent.
+     *
+     * @param desiredRobotRelativeSpeeds Desired robot-relative chassis speeds.
+     * @param dt Loop period, in seconds.
+     * @return The next feasible setpoint.
+     */
+    public SwerveSetpoint generateSetpoint(ChassisSpeeds desiredRobotRelativeSpeeds, double dt) {
+        double accelScale = skidDetector.isSkidding() ? Traction.kSkidAccelerationScale : 1.0;
+        ModuleLimits limits = new ModuleLimits(
+            TunerConstants.kSpeedAt12Volts.in(MetersPerSecond),
+            Traction.kMaxLinearAccelerationMPSSq * accelScale,
+            Traction.kMaxSteeringVelocity.in(RadiansPerSecond)
+        );
+        previousSetpoint = setpointGenerator.generateSetpoint(previousSetpoint, desiredRobotRelativeSpeeds, limits, dt);
+        return previousSetpoint;
+    }
+
+    /**
+     * Resets the remembered setpoint to zero speed at the current module angles. Call this
+     * whenever the drivetrain isn't being actively driven through {@link #generateSetpoint} (e.g.
+     * idling or disabled), so the next call starts cleanly instead of ramping from a stale speed.
+     */
+    public void resetSetpoint() {
+        previousSetpoint = SwerveSetpoint.zero(getState().ModuleStates);
     }
 
     /**
@@ -135,6 +200,16 @@ public class Swerve extends TunerSwerveDrivetrain implements Subsystem {
                 }
                 m_hasAppliedOperatorPerspective = true;
             });
+        }
+
+        skidDetector.update(getState().ModuleStates);
+        SmartDashboard.putBoolean("Swerve/Skidding", skidDetector.isSkidding());
+        SmartDashboard.putNumber("Swerve/SkidRatio", skidDetector.getSkidRatio());
+
+        if (DriverStation.isDisabled()) {
+            // Don't let a stale high-speed setpoint sit around while disabled - start clean
+            // whenever driving resumes.
+            resetSetpoint();
         }
     }
 
