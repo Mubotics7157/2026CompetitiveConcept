@@ -21,15 +21,15 @@ import frc.robot.Ports;
 public class Hood extends SubsystemBase {
     private static final Distance kServoLength = Millimeters.of(100);
     private static final LinearVelocity kMaxServoSpeed = Millimeters.of(20).per(Second);
-    private static final double kMinPosition = 0.01;
+    private static final double kMinPosition = 0;
     private static final double kMaxPosition = 0.77;
     private static final double kPositionTolerance = 0.01;
 
     private final Servo leftServo;
     private final Servo rightServo;
 
-    private double currentPosition = 0.5;
-    private double targetPosition = 0.5;
+    private double currentPosition = 0;
+    private double targetPosition = 0;
     private Time lastUpdateTime = Seconds.of(0);
 
     public Hood() {

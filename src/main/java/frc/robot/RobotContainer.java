@@ -100,6 +100,11 @@ public class RobotContainer {
         driver.leftTrigger().whileTrue(intake.intakeCommand());
         driver.povLeft().whileTrue(intake.outtakeCommand());
         driver.povLeft().whileTrue(floor.reverseFeederCommand());
+        driver.povRight().whileTrue(Commands.startEnd(
+            () -> hood.setPosition(0.5),
+            () -> hood.setPosition(0),
+            hood
+        ));
         driver.leftBumper().onTrue(intake.runOnce(() -> intake.set(Intake.Position.STOWED)));
 
         driver.povUp().onTrue(hanger.positionCommand(Hanger.Position.HANGING));
