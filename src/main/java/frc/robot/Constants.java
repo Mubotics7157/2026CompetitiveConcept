@@ -8,6 +8,7 @@ import static edu.wpi.first.units.Units.Kilograms;
 import static edu.wpi.first.units.Units.RPM;
 import static edu.wpi.first.units.Units.RotationsPerSecond;
 
+import edu.wpi.first.math.util.Units;
 import edu.wpi.first.units.measure.AngularVelocity;
 import edu.wpi.first.units.measure.LinearVelocity;
 import frc.robot.generated.TunerConstants;
@@ -39,7 +40,7 @@ public final class Constants {
      */
     public static class Traction {
         /** Update to the weighed robot mass (with bumpers and battery). */
-        public static final double kMassKg = 18.1436948; // ~40 lb TODO:CHANGE THIS LATER WHEN ROBOT GETS BUILT ON
+        public static final double kMassKg = Units.lbsToKilograms(40); // ~40 lb TODO:CHANGE THIS LATER WHEN ROBOT GETS BUILT ON
 
         /** Roughly 1.0-1.5 for treaded wheels on carpet; lower for slicker wheels/surfaces. */
         public static final double kWheelCoefficientOfFriction = 1.1;
